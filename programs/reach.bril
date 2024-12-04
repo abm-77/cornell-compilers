@@ -1,0 +1,21 @@
+@main {
+  a: int = const 4;
+  b: int = const 10;
+  cond: bool = lt a b;
+  jmp .triv;
+
+.triv:
+  br cond .here .there;
+
+.here:
+  a: int = const 0;
+  jmp .merge;
+
+.there:
+  a: int = const 12;
+  jmp .merge;
+
+.merge:
+  print a;
+
+}
