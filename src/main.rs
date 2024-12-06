@@ -4,21 +4,23 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::io::{self, BufRead};
+use std::ops::Add;
+use std::ops::AddAssign;
+use std::str::FromStr;
 
 type JSONResult<T> = Result<T, serde_json::Error>;
 type Graph<'a> = HashMap<&'a String, HashSet<&'a String>>;
 
 #[derive(Debug, Clone)]
 struct BasicBlock {
-    name: String,
     instructions: Vec<Value>,
 }
 impl BasicBlock {
     fn last(&self) -> Option<&Value> {
         self.instructions.last()
     }
-    fn new(name: String, instructions: Vec<Value>) -> Self {
-        Self { name, instructions }
+    fn new(instructions: Vec<Value>) -> Self {
+        Self { instructions }
     }
     fn len(&self) -> usize {
         self.instructions.len()
@@ -30,11 +32,11 @@ impl BasicBlock {
 
 struct Function {
     pub name: String,
-    pub basic_blocks: Vec<BasicBlock>,
+    pub basic_blocks: Vec<(String, BasicBlock)>,
 }
 
 impl Function {
-    fn new(name: String, basic_blocks: Vec<BasicBlock>) -> Self {
+    fn new(name: String, basic_blocks: Vec<(String, BasicBlock)>) -> Self {
         Self { name, basic_blocks }
     }
 }
@@ -65,8 +67,8 @@ struct LVNTableEntry {
 // CFG has program's lifetime
 #[derive(Debug)]
 struct CFG<'a> {
-    entry: &'a BasicBlock,
-    label2block: HashMap<&'a String, &'a BasicBlock>,
+    entry: String,
+    blocks: HashMap<&'a String, &'a mut BasicBlock>,
     predecessors: Graph<'a>,
     successors: Graph<'a>,
     dominators: Graph<'a>,
@@ -74,15 +76,15 @@ struct CFG<'a> {
 
 impl<'a> CFG<'a> {
     fn new(
-        entry: &'a BasicBlock,
-        label2block: HashMap<&'a String, &'a BasicBlock>,
+        entry: String,
+        blocks: HashMap<&'a String, &'a mut BasicBlock>,
         predecessors: Graph<'a>,
         successors: Graph<'a>,
         dominators: Graph<'a>,
     ) -> Self {
         Self {
             entry,
-            label2block,
+            blocks,
             predecessors,
             successors,
             dominators,
@@ -91,17 +93,17 @@ impl<'a> CFG<'a> {
 
     fn pred2succ_distance(&self, pred: &String, succ: &String) -> i32 {
         let mut dist = -1;
-        let mut worklist = vec![(self.label2block.get(pred).unwrap(), 0)];
+        let mut worklist = vec![(pred, 0)];
         while !worklist.is_empty() {
             let (curr, d) = worklist.pop().unwrap();
-            if curr.name == *succ {
+            if curr == succ {
                 dist = d;
                 break;
             }
 
-            if let Some(succs) = self.successors.get(&curr.name) {
+            if let Some(succs) = self.successors.get(curr) {
                 for s in succs {
-                    worklist.push((self.label2block.get(s).unwrap(), d + 1));
+                    worklist.push((s, d + 1));
                 }
             }
         }
@@ -144,34 +146,22 @@ impl<'a> CFG<'a> {
 
     fn dominance_frontiers(&self) -> Graph<'a> {
         let mut dom_front = Graph::new();
-        let mut visited = HashSet::<&String>::new();
-        let mut worklist = vec![&self.entry.name];
-        while !worklist.is_empty() {
-            let curr = worklist.pop().unwrap();
-            if visited.contains(curr) {
-                continue;
-            }
-            visited.insert(curr);
-            if let Some(succs) = self.successors.get(curr) {
-                worklist.extend(succs.iter());
-            }
-
-            if let Some(preds) = self.predecessors.get(curr) {
+        for block in self.blocks.keys() {
+            if let Some(preds) = self.predecessors.get(block) {
                 if preds.len() < 2 {
                     continue;
                 }
                 for pred in preds {
                     let mut run_dom;
                     let mut runner = pred;
-                    while *runner != self.get_imm_dom(curr) {
-                        dom_front.entry(&runner).or_default().insert(curr);
+                    while *runner != self.get_imm_dom(block) {
+                        dom_front.entry(&runner).or_default().insert(block);
                         run_dom = self.get_imm_dom(runner);
                         runner = &run_dom;
                     }
                 }
             }
         }
-        println!("{:#?}", dom_front);
         dom_front
     }
 }
@@ -195,20 +185,23 @@ fn group_block_instrs(func: Value) -> Vec<Vec<Value>> {
             curr_block = vec![instr.clone()];
         }
     }
-    blocks.push(curr_block.clone());
+    if curr_block.len() > 0 {
+        blocks.push(curr_block.clone());
+    }
     blocks
 }
 
-fn make_blocks(func: Value) -> Vec<BasicBlock> {
+fn make_blocks(func: Value) -> Vec<(String, BasicBlock)> {
     let grouped_instrs = group_block_instrs(func);
     let mut blocks = Vec::new();
     for (i, group) in grouped_instrs.into_iter().enumerate() {
+        println!("{:#?}", group);
         let name = if let Some(label) = group[0]["label"].as_str() {
             label.to_string()
         } else {
-            format!("b-{}", i)
+            format!("b{}", i)
         };
-        blocks.push(BasicBlock::new(name, group));
+        blocks.push((name, BasicBlock::new(group)));
     }
     blocks
 }
@@ -224,22 +217,38 @@ fn make_program(program: Value) -> Program {
     Program::new(functions)
 }
 
-fn make_cfg(program: &Program) -> CFG {
-    // label blocks
-    let mut label2block = HashMap::<&String, &BasicBlock>::new();
-    for func in program.functions.iter() {
-        for block in func.basic_blocks.iter() {
-            label2block.insert(&block.name, &block);
+fn make_cfg<'a>(program: &'a mut Program) -> CFG<'a> {
+    // label
+    let entry = program
+        .functions
+        .get_mut(0)
+        .unwrap()
+        .basic_blocks
+        .get_mut(0)
+        .unwrap()
+        .0
+        .clone();
+
+    let mut flat_order = vec![vec![]];
+    let mut blocks = HashMap::<&String, &mut BasicBlock>::new();
+    for func in program.functions.iter_mut() {
+        let mut level = vec![];
+        for (name, block) in func.basic_blocks.iter_mut() {
+            blocks.insert(name, block);
+            level.push(name.clone());
         }
+        flat_order.push(level);
     }
 
     // construct cfg
     let mut predecessors = Graph::new();
     let mut successors = Graph::new();
-    for func in program.functions.iter() {
-        for (i, block) in func.basic_blocks.iter().enumerate() {
-            successors.insert(&block.name, HashSet::new());
-            let last = block.last().unwrap();
+    for func in flat_order {
+        for (i, name) in func.iter().enumerate() {
+            let name = blocks.keys().find(|s| **s == name).unwrap();
+            successors.insert(name, HashSet::new());
+
+            let last = blocks.get(*name).unwrap().last().unwrap();
             if let Some(op) = last["op"].as_str() {
                 match op {
                     "jmp" | "br" => {
@@ -249,19 +258,19 @@ fn make_cfg(program: &Program) -> CFG {
                             .iter()
                             .map(|x| x.as_str().unwrap().to_string())
                             .collect::<Vec<String>>();
+
                         for dest in dest_labels.iter() {
-                            let label = &label2block.get(dest).unwrap().name;
-                            successors.get_mut(&block.name).unwrap().insert(label);
-                            predecessors.entry(label).or_default().insert(&block.name);
+                            // need to reference prevously stored string
+                            let label = blocks.keys().find(|s| **s == dest).unwrap();
+                            successors.get_mut(*name).unwrap().insert(label);
+                            predecessors.entry(label).or_default().insert(name);
                         }
                     }
-                    "ret" => _ = successors.insert(&block.name, HashSet::new()),
+                    "ret" => _ = successors.insert(name, HashSet::new()),
                     _ => {
-                        if i + 1 < func.basic_blocks.len() {
-                            successors
-                                .get_mut(&block.name)
-                                .unwrap()
-                                .insert(&func.basic_blocks[i + 1].name);
+                        if i + 1 < func.len() {
+                            let label = blocks.keys().find(|s| ***s == func[i + 1]).unwrap();
+                            successors.get_mut(*name).unwrap().insert(label);
                         }
                     }
                 }
@@ -270,53 +279,40 @@ fn make_cfg(program: &Program) -> CFG {
     }
 
     // calculate dominators
-    let entry = &program.functions[0].basic_blocks[0];
     let mut dominators = HashMap::<&String, HashSet<&String>>::new();
     loop {
         let prev_dom = dominators.clone();
-        let mut visited = HashSet::<&String>::new();
-        let mut worklist = vec![entry];
-        while !worklist.is_empty() {
-            let bb = worklist.pop().unwrap();
-            if visited.contains(&bb.name) {
-                continue;
-            }
-            visited.insert(&bb.name);
-
+        for name in blocks.keys() {
             let mut new_val = HashSet::<&String>::new();
-            if let Some(preds) = predecessors.get(&bb.name) {
+            if let Some(preds) = predecessors.get(name) {
                 let mut sets = vec![];
                 for p in preds {
                     if let Some(p_doms) = dominators.get(p) {
                         sets.push(p_doms);
                     }
                 }
-                let (intersection, others) = sets.split_at_mut(1);
-                let mut intersection = intersection[0].clone();
-                for other in others {
-                    intersection.retain(|e| other.contains(e))
-                }
-                new_val.extend(intersection);
-            }
-            new_val.insert(&bb.name);
-            dominators.insert(&bb.name, new_val);
-
-            if let Some(succs) = successors.get(&bb.name) {
-                for s in succs {
-                    worklist.push(label2block.get(s).unwrap());
+                if sets.len() > 0 {
+                    let (intersection, others) = sets.split_at_mut(1);
+                    let mut intersection = intersection[0].clone();
+                    others
+                        .iter()
+                        .for_each(|other| intersection.retain(|e| other.contains(e)));
+                    new_val.extend(intersection);
                 }
             }
+            new_val.insert(name);
+            dominators.insert(name, new_val);
         }
         if dominators == prev_dom {
             break;
         }
     }
 
-    CFG::new(entry, label2block, predecessors, successors, dominators)
+    CFG::new(entry, blocks, predecessors, successors, dominators)
 }
 
 fn reach(cfg: &CFG) {
-    let mut bfs = vec![cfg.entry];
+    let mut bfs = vec![&cfg.entry];
     let mut vcs = HashMap::<String, i32>::new();
     let mut gen = HashMap::<&String, HashSet<String>>::new();
     let mut kill = HashMap::<&String, HashSet<String>>::new();
@@ -324,31 +320,30 @@ fn reach(cfg: &CFG) {
 
     // make the gen and kill sets
     while !bfs.is_empty() {
-        let b = bfs.pop().unwrap();
-        if visited.contains(&b.name) {
+        let name = bfs.pop().unwrap();
+        if visited.contains(name) {
             continue;
         }
-        visited.insert(&b.name);
+        visited.insert(name);
 
+        let b = cfg.blocks.get(name).unwrap();
         for instr in b.instructions.iter() {
             if let Some(dest) = instr["dest"].as_str() {
                 *vcs.entry(dest.to_string()).or_default() += 1;
                 let version = *vcs.get(dest).unwrap();
 
-                gen.entry(&b.name)
+                gen.entry(name)
                     .or_default()
                     .insert(format!("{dest}{version}"));
 
                 for i in 0..=version {
-                    kill.entry(&b.name)
-                        .or_default()
-                        .insert(format!("{dest}{i}"));
+                    kill.entry(name).or_default().insert(format!("{dest}{i}"));
                 }
             }
         }
 
-        for s in cfg.successors.get(&b.name).unwrap() {
-            bfs.push(cfg.label2block.get(s).unwrap());
+        for s in cfg.successors.get(name).unwrap() {
+            bfs.push(s);
         }
     }
 
@@ -359,39 +354,39 @@ fn reach(cfg: &CFG) {
     let mut outs = HashMap::<&String, HashSet<&String>>::new();
     let mut worklist = vec![&cfg.entry];
     while !worklist.is_empty() {
-        let b = worklist.pop().unwrap();
+        let bb = worklist.pop().unwrap();
 
         // merge
-        if let Some(preds) = cfg.predecessors.get(&b.name) {
+        if let Some(preds) = cfg.predecessors.get(bb) {
             preds.iter().for_each(|p| {
                 let out_p = outs.entry(*p).or_default();
-                ins.entry(&b.name).or_default().extend(out_p.iter());
+                ins.entry(bb).or_default().extend(out_p.iter());
             });
         }
 
         // transfer: out[b] = (in_b - KILLS) + DEF_b
         let mut transfer = HashSet::new();
-        if let Some(input) = ins.get(&b.name) {
+        if let Some(input) = ins.get(bb) {
             transfer = input.clone();
         }
-        if let Some(k) = kill.get(&b.name) {
+        if let Some(k) = kill.get(bb) {
             for killed in k {
                 transfer.remove(killed);
             }
         }
-        if let Some(g) = gen.get(&b.name) {
+        if let Some(g) = gen.get(bb) {
             for genned in g {
                 transfer.insert(genned);
             }
         }
 
         // if out[b] has changed
-        let out_start = outs.entry(&b.name).or_default().clone();
-        outs.insert(&b.name, transfer);
-        if *outs.get(&b.name).unwrap() != out_start {
-            let success = cfg.successors.get(&b.name).unwrap();
+        let out_start = outs.entry(bb).or_default().clone();
+        outs.insert(bb, transfer);
+        if *outs.get(bb).unwrap() != out_start {
+            let success = cfg.successors.get(bb).unwrap();
             for s in success {
-                worklist.push(cfg.label2block.get(s).unwrap());
+                worklist.push(s);
             }
         }
     }
@@ -404,7 +399,7 @@ fn dce(function: &mut Function) {
     loop {
         let mut used = HashSet::new();
         let mut eliminated = 0;
-        for bb in function.basic_blocks.iter_mut() {
+        for (_, bb) in function.basic_blocks.iter_mut() {
             loop {
                 let mut assigned = HashSet::new();
                 let mut keep = Vec::with_capacity(bb.len());
@@ -437,7 +432,7 @@ fn dce(function: &mut Function) {
                 }
             }
         }
-        for bb in function.basic_blocks.iter_mut() {
+        for (_, bb) in function.basic_blocks.iter_mut() {
             bb.instructions.retain(|instr| {
                 if let Some(dest) = instr["dest"].as_str() {
                     if !used.contains(dest) {
@@ -528,6 +523,162 @@ fn lvn(bb: &mut BasicBlock) {
     println!("{:?}", bb);
 }
 
+fn to_ssa(cfg: &mut CFG) {
+    // find definitions
+    let mut defs = HashMap::<String, HashSet<&String>>::new();
+    for (name, bb) in cfg.blocks.iter() {
+        for instr in bb.instructions.iter() {
+            if let Some(dest) = instr["dest"].as_str() {
+                defs.entry(dest.to_string()).or_default().insert(name);
+            }
+        }
+    }
+
+    // place phi nodes at junctions
+    let dom_fronts = cfg.dominance_frontiers();
+    let mut phi_placements = HashMap::<&String, HashSet<String>>::new();
+    loop {
+        let old_defs = defs.clone();
+        for (var, defsites) in old_defs.iter() {
+            for defsite in defsites.iter() {
+                if let Some(df) = dom_fronts.get(defsite) {
+                    for node in df {
+                        phi_placements.entry(node).or_default().insert(var.clone());
+                        if !defsites.contains(*node) {
+                            defs.entry(var.clone()).or_default().insert(node);
+                        }
+                    }
+                }
+            }
+        }
+
+        if old_defs == defs {
+            break;
+        }
+    }
+
+    // rename variables
+    let dtree = cfg.dominanator_tree();
+    let mut worklist = vec![&cfg.entry];
+    let mut stack = HashMap::<&String, Vec<String>>::new();
+    let mut vcs = HashMap::<&String, i32>::new();
+    let mut phi_dests = HashMap::<(&String, &String), String>::new();
+    let mut phi_args = HashMap::<(&String, &String), Vec<String>>::new();
+
+    for v in defs.keys() {
+        vcs.insert(v, 0);
+        stack.insert(v, vec![format!("{}.0", v)]);
+    }
+
+    while !worklist.is_empty() {
+        let bb_name = worklist.pop().unwrap();
+        let bb = cfg.blocks.get_mut(bb_name).unwrap();
+        let old_stack = stack.clone();
+
+        if let Some(phi_vars) = phi_placements.get(bb_name) {
+            for var in phi_vars {
+                let version = *vcs.get(var).unwrap();
+                let new = format!("{}.{}", var, version);
+                vcs.get_mut(var).unwrap().add_assign(1);
+                stack.get_mut(var).unwrap().push(new);
+                phi_dests.insert(
+                    (bb_name, var),
+                    stack.get(var).unwrap().last().unwrap().clone(),
+                );
+            }
+        }
+
+        for instr in bb.instructions.iter_mut() {
+            if let Some(args) = instr["args"].as_array_mut() {
+                for arg in args.iter_mut() {
+                    let old = arg.as_str().unwrap().to_string();
+                    println!("{old}");
+                    let top = stack.get(&old).unwrap().last().unwrap();
+                    *arg = json!(top);
+                }
+            }
+
+            if let Some(dest) = instr["dest"].as_str() {
+                let old = dest.to_string();
+                let version = *vcs.get(&old).unwrap();
+                let new = format!("{}.{}", old, version);
+                vcs.get_mut(&old).unwrap().add_assign(1);
+                stack.get_mut(&old).unwrap().push(new);
+                instr["dest"] = json!(stack.get(&old).unwrap().last().unwrap());
+            }
+        }
+
+        if let Some(succs) = cfg.successors.get(bb_name) {
+            for succ in succs {
+                if let Some(phi_vars) = phi_placements.get(succ) {
+                    for var in phi_vars {
+                        if stack.contains_key(var) {
+                            phi_args.entry((succ, var)).or_default().extend(vec![
+                                bb_name.clone(),
+                                stack.get(var).unwrap().last().unwrap().clone(),
+                            ]);
+                        } else {
+                            phi_args
+                                .entry((succ, var))
+                                .or_default()
+                                .extend(vec![bb_name.clone(), String::from("__undefined")]);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(subs) = dtree.get(bb_name) {
+            worklist.extend(subs.iter().filter(|s| **s != bb_name));
+        }
+
+        stack.clear();
+        stack.extend(old_stack);
+    }
+
+    // insert phi instructions
+    for ((dest, old), new) in phi_dests {
+        let bb = cfg.blocks.get_mut(dest).unwrap();
+        let args = phi_args.get(&(dest, old)).unwrap();
+        bb.instructions
+            .insert(0, json!({"op": "phi", "args": args, "dest": new}));
+    }
+}
+
+fn from_ssa(cfg: &mut CFG) {
+    let mut locations = Vec::new();
+    for (_, bb) in cfg.blocks.iter_mut() {
+        bb.instructions.retain_mut(|instr| {
+            if instr["op"].as_str().is_some_and(|op| op == "op") {
+                let args = instr["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect::<Vec<String>>();
+                args.chunks(2).for_each(|pair| {
+                    locations.push((
+                        pair[0].clone(),
+                        instr["dest"].as_str().unwrap().to_string(),
+                        pair[1].clone(),
+                    ));
+                });
+                return false;
+            }
+            return true;
+        });
+    }
+
+    for (pred, dest, val) in locations {
+        let pred_bb = cfg.blocks.get_mut(&pred).unwrap();
+        pred_bb.instructions.push(json!({
+            "op": "id",
+            "dest": dest,
+            "args": [val],
+        }));
+    }
+}
+
 // find node with no children and add a print instrction
 fn simple_cfg_transform(cfg: &mut (Vec<(String, BasicBlock)>, HashMap<String, Vec<String>>)) {
     for (label, block) in cfg.0.iter_mut() {
@@ -548,9 +699,12 @@ fn main() -> JSONResult<()> {
     }
 
     let json: Value = serde_json::from_str(data.as_str())?;
-    let program = make_program(json);
-    let cfg = make_cfg(&program);
-    let _ = cfg.dominance_frontiers();
+    let mut program = make_program(json);
+    let mut cfg = make_cfg(&mut program);
+    //let _ = cfg.dominance_frontiers();
+    to_ssa(&mut cfg);
+    from_ssa(&mut cfg);
+    println!("{:#?}", cfg.blocks);
 
     Ok(())
 }
